@@ -2202,6 +2202,14 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
       let cacheOK = false;
       try { cacheOK = !!(window.caches && await window.caches.has('transformers-cache')) || 'caches' in window; } catch (e) { cacheOK = false; }
       mod.env.useBrowserCache = cacheOK;
+      // mobile guard: multi-threaded WASM without cross-origin isolation crashes
+      // Android WebViews and older iOS Safari — pin to single thread when isolated
+      try {
+        if (mod.env && mod.env.backends && mod.env.backends.onnx && mod.env.backends.onnx.wasm &&
+            (typeof crossOriginIsolated === 'undefined' || !crossOriginIsolated)) {
+          mod.env.backends.onnx.wasm.numThreads = 1;
+        }
+      } catch (e) {}
       S.tf = mod;
       return mod;
     }
@@ -2292,7 +2300,8 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
         } else {
           inputs = tok(text);
         }
-        const nPrompt = inputs.input_ids.dims.at(-1);
+        const dims = inputs.input_ids.dims || [];
+        const nPrompt = dims[dims.length - 1]; // .at() crashes Safari < 15.4 at parse time
         const streamer = new tf.TextStreamer(tok, {
           skip_prompt: true,
           skip_special_tokens: true,
@@ -2580,6 +2589,43 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
    ============================================================ */
 (function () {
   'use strict';
+  /* ---- crash surface: show visible error instead of silent white screen (mobile) ---- */
+  window.addEventListener('error', (e) => {
+    try {
+      let el = document.getElementById('crash-banner');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'crash-banner';
+        el.style.cssText = 'position:fixed;bottom:0;left:0;right:0;z-index:99999;max-height:38%;overflow:auto;' +
+          'background:rgba(120,10,10,.94);color:#fff;font:12px monospace;padding:10px 12px;white-space:pre-wrap;';
+        (document.body || document.documentElement).appendChild(el);
+      }
+      el.textContent = 'RUNTIME FAULT // ' + (e.message || 'unknown') + ' @ ' + (e.filename || '').split('/').pop() + ':' + e.lineno;
+    } catch (err) {}
+  });
+  window.addEventListener('unhandledrejection', (e) => {
+    try { console.warn('[unhandled]', e.reason); } catch (err) {}
+  });
+
+  /* ---- safe storage: localStorage throws SecurityError in private mode / in-app
+          browsers (WhatsApp, QR scanners, some WebViews) — that killed the whole
+          app on mobile. Shim degrades to in-memory storage. ---- */
+  const store = (() => {
+    try {
+      const t = '__ultron_probe__';
+      window.localStorage.setItem(t, '1');
+      window.localStorage.removeItem(t);
+      return window.localStorage;
+    } catch (e) {
+      const m = {};
+      return {
+        getItem: (k) => (k in m ? m[k] : null),
+        setItem: (k, v) => { m[k] = String(v); },
+        removeItem: (k) => { delete m[k]; },
+      };
+    }
+  })();
+
   const $ = (s) => document.querySelector(s);
   const $$ = (s) => Array.from(document.querySelectorAll(s));
   const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -2657,12 +2703,12 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
     },
   };
 
-  let persona = localStorage.getItem('ultron.pers') || 'ultron';
+  let persona = store.getItem('ultron.pers') || 'ultron';
   if (!PERSONAS[persona]) persona = 'ultron';
 
   function applyPersona(k, silent) {
     persona = k;
-    localStorage.setItem('ultron.pers', k);
+    store.setItem('ultron.pers', k);
     const p = PERSONAS[k];
     document.body.dataset.pers = k;
     $('#chip-pers-t').textContent = p.label;
@@ -2708,9 +2754,9 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
     if (!email || !pass) { loginError.textContent = '// ACCESS DENIED — CREDENTIALS REQUIRED'; return; }
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { loginError.textContent = '// ACCESS DENIED — INVALID EMAIL FORMAT'; return; }
     loginError.textContent = '';
-    localStorage.setItem('ultron.auth', email);
+    store.setItem('ultron.auth', email);
     setOperator(email);
-    const modelReady = !!localStorage.getItem('ultron.model.ready');
+    const modelReady = !!store.getItem('ultron.model.ready');
     if (modelReady) {
       showScene('scene-workspace');
       enterWorkspace();
@@ -2761,7 +2807,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
 
   function setModelUI(mKey) {
     bootState.model = mKey;
-    localStorage.setItem('ultron.model', mKey);
+    store.setItem('ultron.model', mKey);
     $$('#seg-model button').forEach((b) => b.classList.toggle('sel', b.dataset.m === mKey));
     const reg = UEngine.MODELS[mKey];
     $('#dl-model-name').textContent = reg.repo;
@@ -2779,7 +2825,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
 
   function setDtypeUI(dtypeKey) {
     bootState.dtype = dtypeKey;
-    localStorage.setItem('ultron.dtype', dtypeKey);
+    store.setItem('ultron.dtype', dtypeKey);
     $$('#seg-dtype button').forEach((b) => b.classList.toggle('sel', b.dataset.d === dtypeKey));
     renderBootRows(dtypeKey);
     const M = UEngine.manifestFor(bootState.model, dtypeKey);
@@ -2850,6 +2896,9 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
     bootBtn.disabled = true;
     bootBtn.textContent = 'CONNECTING TO HUB...';
     $('#boot-alarm-text').textContent = 'Downloading local weights';
+    if (UDevice.isMobile() && bootState.model === 'qwen') {
+      toast('HEAVY FOR A PHONE — IF THE TAB DIES, USE TEST MODE · SMOLVLM-500M', true);
+    }
     let speedAccum = 0, lastTick = performance.now();
 
     UEngine.download(bootState.model, bootState.dtype, (ev) => {
@@ -2888,8 +2937,8 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
 
   function finishBoot(backend) {
     bootState.done = true;
-    localStorage.setItem('ultron.model.ready', bootState.model);
-    localStorage.setItem('ultron.model', bootState.model);
+    store.setItem('ultron.model.ready', bootState.model);
+    store.setItem('ultron.model', bootState.model);
     pipeFill.style.width = '100%';
     pipePct.textContent = '100%'; pipePct.style.color = '#6ee7b7';
     pipeSpeed.textContent = '— MB/s';
@@ -2915,8 +2964,8 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
     }
   });
 
-  bootState.model = localStorage.getItem('ultron.model') || 'qwen';
-  bootState.dtype = localStorage.getItem('ultron.dtype') || (hasWebGPU() ? 'q4f16' : 'q4');
+  bootState.model = store.getItem('ultron.model') || 'qwen';
+  bootState.dtype = store.getItem('ultron.dtype') || (hasWebGPU() && !UDevice.isMobile() ? 'q4f16' : 'q4'); // mobile: WebGPU + 2B model kills the tab — default WASM
   setModelUI(bootState.model);
   setDtypeUI(bootState.dtype);
   // probe for a REAL WebGPU adapter (navigator.gpu can exist without one)
@@ -2927,7 +2976,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
       if (bootState.dtype === 'q4f16' && !bootState.started && !bootState.done) setDtypeUI('q4');
     }
   });
-  const readyKey = localStorage.getItem('ultron.model.ready');
+  const readyKey = store.getItem('ultron.model.ready');
   if (readyKey === bootState.model) {
     // resumed session, same model: show everything cached, button jumps straight to workbench
     const M = UEngine.manifestFor(bootState.model, bootState.dtype);
@@ -2943,7 +2992,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
     syncEta.textContent = 'ESTIMATED: 0s';
   } else if (readyKey) {
     // cache holds a different model than the selected one — fresh sync required
-    localStorage.removeItem('ultron.model.ready');
+    store.removeItem('ultron.model.ready');
   }
 
   /* ============================================================
@@ -3308,7 +3357,8 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
           const cap = wantsWords[1] | 0;
           const out = [];
           let used = 0;
-          for (const sent of body.split(/(?<=[.!?])\s+/)) {
+          // lookbehind regex crashes Safari < 16.4 at PARSE time — compatible splitter
+          for (const sent of (body.match(/[^.!?\n]+[.!?]?\s*/g) || [body])) {
             const w = words(sent).length;
             if (used + w > cap) break;
             out.push(sent); used += w;
@@ -3369,6 +3419,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
   async function sendChat() {
     const text = chatInput.value.trim();
     if (!text && !attachments.length) return;
+    stopSpeaking(); // interrupt the voice when the operator talks over it
     if (sourceMode === 'local' && !UEngine.ready && !UEngine.state.loading) {
       toast('DEEP CORE ASLEEP — LOCAL ANALYSIS CORE TAKING THE QUESTION');
     }
@@ -3404,7 +3455,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
       setTimeout(async () => {
         let reply;
         try {
-          const mKey = UEngine.state.modelKey || localStorage.getItem('ultron.model') || 'qwen';
+          const mKey = UEngine.state.modelKey || store.getItem('ultron.model') || 'qwen';
           reply = await ULocalCore.reply(text || '', myAtts, persona, {
             engineReady: UEngine.ready,
             model: (UEngine.MODELS[mKey] || UEngine.MODELS.qwen).short,
@@ -3475,7 +3526,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
       // machine claimed f16 but the kernel died — rebuild on INT4 WASM and retry once
       addSysNote('// F16 KERNEL FAULT — REBUILDING CORE ON INT4 · WASM');
       toast('F16 PATH UNUSABLE — SWITCHING TO INT4 · WASM', true);
-      localStorage.setItem('ultron.dtype', 'q4');
+      store.setItem('ultron.dtype', 'q4');
       bootState.dtype = 'q4';
       UEngine.state.ready = false; UEngine.state.dtype = null;
       history.pop();
@@ -3544,11 +3595,97 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
     $('#tk-ctx').textContent = Math.max(0.1, k).toFixed(1) + 'K';
   }
 
-  /* ---------------- speech overlay + waveform ---------------- */
+  /* ---------------- speech overlay + waveform + REAL TTS ---------------- */
   const sentenceEl = $('#sentence'), waveEl = $('#wave');
   let speaking = false, speakUntil = 0, typeTimer = null;
   for (let i = 0; i < 16; i++) waveEl.appendChild(document.createElement('i'));
   const waveBars = Array.from(waveEl.children);
+
+  const TTS = {
+    supported: 'speechSynthesis' in window,
+    on: store.getItem('ultron.tts') !== 'off',
+    voices: [],
+    active: false,
+    chunks: [],
+    idx: 0,
+  };
+  const VOICE_PREF = {
+    ultron:  { want: ['google uk english male', 'daniel', 'microsoft guy', 'alex', 'fred'], pitch: 0.6, rate: 0.95 },
+    jarvis:  { want: ['daniel', 'google uk english male', 'microsoft ryan', 'oliver', 'alex'], pitch: 0.9, rate: 1.0 },
+    friday:  { want: ['google uk english female', 'samantha', 'microsoft zira', 'victoria', 'karen'], pitch: 1.12, rate: 1.05 },
+  };
+  function loadVoices() {
+    if (!TTS.supported) return;
+    TTS.voices = speechSynthesis.getVoices() || [];
+  }
+  if (TTS.supported) {
+    loadVoices();
+    if (typeof speechSynthesis.addEventListener === 'function') {
+      speechSynthesis.addEventListener('voiceschanged', loadVoices);
+    } else {
+      speechSynthesis.onvoiceschanged = loadVoices; // older iOS Safari
+    }
+    setTimeout(loadVoices, 400); setTimeout(loadVoices, 1500); // some engines fill late
+  }
+  function pickVoice() {
+    const pref = (VOICE_PREF[persona] || VOICE_PREF.ultron).want;
+    const en = TTS.voices.filter((v) => /^en/i.test(v.lang));
+    const pool = en.length ? en : TTS.voices;
+    for (const w of pref) {
+      const hit = pool.find((v) => v.name.toLowerCase().includes(w));
+      if (hit) return hit;
+    }
+    return pool.find((v) => /male|daniel|alex/i.test(v.name)) || pool[0] || null;
+  }
+  function cleanSpeech(t) {
+    return (t || '')
+      .replace(/```[\s\S]*?```/g, ' code block ')
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+      .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+      .replace(/[*_#`>|~]/g, ' ')
+      .replace(/https?:\/\/\S+/g, ' link ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+  function chunkSpeech(t) {
+    const parts = t.match(/[^.!?\n]+[.!?]?\s*/g) || [t];
+    const out = [];
+    let cur = '';
+    for (const p of parts) {
+      if ((cur + ' ' + p).length > 170 && cur) { out.push(cur.trim()); cur = p; }
+      else cur = (cur ? cur + ' ' : '') + p;
+    }
+    if (cur.trim()) out.push(cur.trim());
+    return out;
+  }
+  function stopSpeaking() {
+    if (TTS.supported) { try { speechSynthesis.cancel(); } catch (e) {} }
+    TTS.active = false; TTS.chunks = []; TTS.idx = 0;
+    speaking = false; speakUntil = 0;
+    waveEl.classList.remove('speaking');
+    clearInterval(typeTimer);
+  }
+  function speakNextChunk() {
+    if (!TTS.active) return;
+    if (TTS.idx >= TTS.chunks.length) { stopSpeaking(); return; }
+    speakUntil = performance.now() + 6000; // keep the waveform alive while the voice runs
+    const u = new SpeechSynthesisUtterance(TTS.chunks[TTS.idx++]);
+    const vp = VOICE_PREF[persona] || VOICE_PREF.ultron;
+    const v = pickVoice();
+    if (v) u.voice = v;
+    u.pitch = vp.pitch; u.rate = vp.rate; u.volume = 1;
+    u.onend = () => { if (TTS.active) speakNextChunk(); };
+    u.onerror = () => { stopSpeaking(); };
+    try { speechSynthesis.speak(u); } catch (e) { stopSpeaking(); }
+  }
+  function speakReal(text) {
+    const clean = cleanSpeech(text);
+    if (!clean) return;
+    TTS.chunks = chunkSpeech(clean);
+    TTS.idx = 0;
+    TTS.active = true;
+    speakNextChunk();
+  }
 
   function speak(text) {
     speaking = true;
@@ -3562,6 +3699,11 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
       sentenceEl.textContent = shown.slice(0, ++i);
       if (i >= shown.length) clearInterval(typeTimer);
     }, 26);
+    if (TTS.supported && TTS.on) {
+      if (TTS.active) { try { speechSynthesis.cancel(); } catch (e) {} }
+      // Chrome drops an utterance queued in the same tick as cancel() — delay it
+      setTimeout(() => { if (TTS.on && TTS.supported) speakReal(text); }, 80);
+    }
   }
 
   function speakLive(tail) {
@@ -3569,6 +3711,16 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
     speakUntil = performance.now() + 1200;
     sentenceEl.textContent = '…' + tail;
   }
+
+  // click the waveform to mute / unmute the voice
+  waveEl.style.cursor = 'pointer';
+  waveEl.title = 'Toggle voice output';
+  waveEl.addEventListener('click', () => {
+    TTS.on = !TTS.on;
+    store.setItem('ultron.tts', TTS.on ? 'on' : 'off');
+    if (!TTS.on) stopSpeaking();
+    toast(TTS.on ? 'VOICE OUTPUT ONLINE' : 'VOICE OUTPUT MUTED');
+  });
 
   function waveLoop() {
     requestAnimationFrame(waveLoop);
@@ -3587,24 +3739,66 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
   }
   waveLoop();
 
-  /* ---------------- mic (demo capture) ---------------- */
+  /* ---------------- mic (real voice input) ---------------- */
   const micBtn = $('#mic-btn');
-  let micTimer = null;
-  const MIC_PROMPTS = [
-    'Summarize everything I attached so far and keep it under 200 words.',
-    'What can this offline station do without any network access?',
-    'Draft an export-ready action list from the last answer.',
-  ];
-  micBtn.addEventListener('click', () => {
-    if (micTimer || generating) return;
-    micBtn.classList.add('rec');
-    pushAudio(0.8);
-    micTimer = setTimeout(() => {
-      micBtn.classList.remove('rec');
-      micTimer = null;
-      chatInput.value = MIC_PROMPTS[Math.floor(Math.random() * MIC_PROMPTS.length)];
+  micBtn.title = 'Voice input';
+  const SRClass = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let recog = null, listening = false, voiceFinal = false;
+  if (SRClass) {
+    recog = new SRClass();
+    recog.lang = 'en-US';
+    recog.interimResults = true;
+    recog.continuous = false;
+    recog.maxAlternatives = 1;
+    recog.onstart = () => { listening = true; micBtn.classList.add('rec'); toast('LISTENING — SPEAK NOW'); };
+    recog.onresult = (e) => {
+      let interim = '', final = '';
+      for (let i = 0; i < e.results.length; i++) {
+        const r = e.results[i];
+        if (r.isFinal) final += r[0].transcript;
+        else interim += r[0].transcript;
+      }
+      if (final) { voiceFinal = true; chatInput.value = final.trim(); }
+      else if (interim) chatInput.value = interim.trim();
       autoGrow();
-    }, 1400);
+      chatFeed.scrollTop = chatFeed.scrollHeight;
+    };
+    recog.onerror = (e) => {
+      const map = {
+        'not-allowed': 'MIC BLOCKED — ALLOW MICROPHONE IN THE BROWSER',
+        'service-not-allowed': 'MIC SERVICE BLOCKED — ALLOW MICROPHONE PERMISSION',
+        'no-speech': 'NO SPEECH DETECTED — TRY AGAIN',
+        'audio-capture': 'NO MICROPHONE FOUND',
+        'network': 'SPEECH SERVICE NEEDS NETWORK — TYPING STILL WORKS OFFLINE',
+      };
+      toast(map[e.error] || ('MIC ERROR — ' + e.error).toUpperCase(), e.error !== 'no-speech' && e.error !== 'aborted');
+    };
+    recog.onend = () => {
+      listening = false;
+      micBtn.classList.remove('rec');
+      if (voiceFinal && chatInput.value.trim() && !generating) {
+        voiceFinal = false;
+        setTimeout(() => { if (!generating) sendChat(); }, 350);
+      }
+    };
+  }
+  micBtn.addEventListener('click', () => {
+    if (generating) return;
+    if (listening) { voiceFinal = false; try { recog.stop(); } catch (e) {} return; }
+    if (recog) {
+      voiceFinal = false;
+      try { recog.start(); pushAudio(0.8); }
+      catch (e) { /* start() throws if already running — ignore */ }
+    } else {
+      // fallback: browser has no speech engine (Firefox / old Safari) — demo capture
+      toast('SPEECH ENGINE UNAVAILABLE IN THIS BROWSER — INSERTING DEMO PROMPT', true);
+      micBtn.classList.add('rec');
+      setTimeout(() => {
+        micBtn.classList.remove('rec');
+        chatInput.value = 'Summarize everything I attached so far and keep it under 200 words.';
+        autoGrow();
+      }, 1400);
+    }
   });
 
   /* ---------------- persona UI wiring ---------------- */
@@ -3687,8 +3881,8 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
   }
 
   function applyEngineReadouts() {
-    const mKey = UEngine.state.modelKey || localStorage.getItem('ultron.model') || 'qwen';
-    const dtypeKey = UEngine.state.dtype || localStorage.getItem('ultron.dtype') || 'q4';
+    const mKey = UEngine.state.modelKey || store.getItem('ultron.model') || 'qwen';
+    const dtypeKey = UEngine.state.dtype || store.getItem('ultron.dtype') || 'q4';
     const M = UEngine.manifestFor(mKey, dtypeKey);
     if (!M) return;
     const reg = UEngine.MODELS[mKey] || UEngine.MODELS.qwen;
@@ -3711,9 +3905,9 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
     $('#eng-chip').className = 'chip';
     $('#eng-chip').innerHTML = '<span class="dot"></span>LOADING';
     syncText && (syncText.textContent = '');
-    let dtype = localStorage.getItem('ultron.dtype') || (hasWebGPU() ? 'q4f16' : 'q4');
+    let dtype = store.getItem('ultron.dtype') || (hasWebGPU() && !UDevice.isMobile() ? 'q4f16' : 'q4');
     if (dtype === 'q4f16' && !(await UEngine.probeWebGPU())) dtype = 'q4';
-    const mKey = UEngine.state.modelKey || localStorage.getItem('ultron.model') || 'qwen';
+    const mKey = UEngine.state.modelKey || store.getItem('ultron.model') || 'qwen';
     let lastPct = -1;
     await UEngine.ensureLoaded(mKey, dtype, (ev) => {
       if (ev.type === 'file') {
@@ -3755,7 +3949,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
   }
 
   function enterWorkspace() {
-    setOperator(localStorage.getItem('ultron.auth') || $('#login-email').value || 'operator@starkindustries.ai');
+    setOperator(store.getItem('ultron.auth') || $('#login-email').value || 'operator@starkindustries.ai');
     if (!wsStarted) {
       wsStarted = true; wsStartT = Date.now();
       applyPersona(persona, true);
